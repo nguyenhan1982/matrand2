@@ -1,327 +1,291 @@
-import os
-import io
 import pandas as pd
 import numpy as np
-from datetime import datetime
 from pathlib import Path
+import re
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import tempfile
-import logging
+import os
+import shutil
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for all routes
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# --- Constants ---
+# Define constants for numeric columns
 NO_COLS = [f'No{i}' for i in range(1, 28)]
-
-# --- Helper Functions (as per request) ---
 
 def parse_date_dayfirst(s: pd.Series) -> pd.Series:
     """
-    Parses a pd.Series into datetime objects robustly, prioritizing day-first format.
-    Handles Excel serial dates, common day-first string formats, and a general fallback.
+    Phân tích cú pháp một pd.Series thành các đối tượng datetime64[ns] một cách mạnh mẽ,
+    ưu tiên định dạng ngày-đầu-tiên (day-first).
     """
-    # Convert NaNs, empty strings, 'NaT' to actual NaNs for consistent handling
-    s_cleaned = s.replace({None: np.nan, 'NaT': np.nan, '': np.nan}).astype(str).replace('nan', np.nan)
+    # Bước 0: Chuyển đổi các giá trị rỗng, NaT, nan, None thành None để xử lý nhất quán
+    s = s.replace({np.nan: None, pd.NaT: None, 'nan': None, '': None}).astype(str)
 
-    # Step 1: Excel Serial Dates
-    excel_dates = pd.to_numeric(s_cleaned, errors='coerce')
-    is_excel_date = (excel_dates >= 1) & (excel_dates <= 80000) & (~excel_dates.isna())
+    parsed_dates = pd.Series([pd.NaT] * len(s), index=s.index, dtype='datetime64[ns]')
     
-    parsed_dates = pd.NaT.to_series(index=s.index)
-    if is_excel_date.any():
-        excel_epoch = datetime(1899, 12, 30) # Excel's 1900-based date system origin
-        # pd.to_datetime with unit='D' and origin handles the conversion from serial number
-        parsed_dates.loc[is_excel_date] = pd.to_datetime(excel_dates.loc[is_excel_date], unit='D', origin=excel_epoch)
+    # Bước 1 (Excel Serial Dates): Cố gắng chuyển đổi các giá trị số thành ngày serial của Excel
+    # Chỉ xử lý các giá trị không phải NaT và có thể chuyển đổi thành số
+    numeric_s = pd.to_numeric(s, errors='coerce')
+    excel_mask = (numeric_s.notna()) & (numeric_s >= 1) & (numeric_s <= 80000)
+    
+    if excel_mask.any():
+        excel_dates = pd.to_datetime(numeric_s[excel_mask], unit='D', origin=pd.Timestamp('1899-12-30'), errors='coerce')
+        parsed_dates.loc[excel_mask] = excel_dates
 
-    # Step 2: Common Day-First String Formats
-    remaining_indices = parsed_dates.isna() & (~s_cleaned.isna())
-    if remaining_indices.any():
-        common_dayfirst_formats = [
-            '%d-%m-%Y', '%d/%m/%Y', '%d.%m.%Y',
-            '%d-%m-%y', '%d/%m/%y',
-            '%Y-%m-%d' # Also include YYYY-MM-DD as it's common and can be day-first if ambiguous
-        ]
-        for fmt in common_dayfirst_formats:
-            try:
-                temp_parsed = pd.to_datetime(s_cleaned[remaining_indices], format=fmt, errors='coerce')
-                parsed_dates.loc[remaining_indices & ~temp_parsed.isna()] = temp_parsed.loc[remaining_indices & ~temp_parsed.isna()]
-                remaining_indices = parsed_dates.isna() & (~s_cleaned.isna())
-                if not remaining_indices.any(): # Stop if all remaining values are parsed
-                    break
-            except Exception:
-                # Continue to next format if parsing fails for any reason
-                continue 
+    # Bước 2 (Các định dạng ngày-đầu-tiên phổ biến):
+    dayfirst_formats = ['%d-%m-%Y', '%d/%m/%Y', '%d.%m.%Y', '%d-%m-%y', '%d/%m/%y', '%Y-%m-%d']
+    
+    for fmt in dayfirst_formats:
+        # Chỉ cố gắng phân tích các giá trị vẫn còn là NaT
+        remaining_mask = parsed_dates.isna()
+        if not remaining_mask.any():
+            break # Tất cả đã được phân tích
+        
+        try:
+            temp_parsed = pd.to_datetime(s[remaining_mask], format=fmt, errors='coerce')
+            parsed_dates.loc[remaining_mask] = parsed_dates.loc[remaining_mask].fillna(temp_parsed)
+        except Exception:
+            # Continue to next format if there's an issue with the format
+            pass
 
-    # Step 3: General Fallback
-    remaining_indices = parsed_dates.isna() & (~s_cleaned.isna())
-    if remaining_indices.any():
-        parsed_dates.loc[remaining_indices] = pd.to_datetime(s_cleaned[remaining_indices], dayfirst=True, errors='coerce')
+    # Bước 3 (Thử lại tổng quát): Đối với bất kỳ giá trị nào vẫn còn NaT, thử với dayfirst=True
+    remaining_mask = parsed_dates.isna()
+    if remaining_mask.any():
+        general_parsed = pd.to_datetime(s[remaining_mask], dayfirst=True, errors='coerce')
+        parsed_dates.loc[remaining_mask] = parsed_dates.loc[remaining_mask].fillna(general_parsed)
 
-    return parsed_dates.dt.normalize() # Remove time component
-
+    # Làm sạch: Chuẩn hóa để loại bỏ thông tin thời gian
+    return parsed_dates.dt.normalize()
 
 def load_csv(path: Path) -> pd.DataFrame:
     """
-    Loads the input CSV, cleans data, normalizes column names, detects and standardizes
-    the date column, and ensures the existence of No1 to No27 numeric columns.
+    Tải tệp CSV đầu vào, làm sạch dữ liệu, chuẩn hóa tên cột, phát hiện và chuẩn hóa cột ngày,
+    và đảm bảo sự tồn tại của các cột số No1 đến No27.
     """
     if not path.exists():
-        app.logger.error(f"Input file not found: {path}")
-        raise FileNotFoundError(f"Input file not found: {path}")
+        raise FileNotFoundError(f"Tệp đầu vào không tìm thấy tại: {path}")
 
-    # Read CSV with all columns as string to prevent premature type conversion
-    # and keep empty strings explicitly.
-    df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding='utf-8')
+    # Đọc CSV với dtype=str để giữ tất cả các giá trị dưới dạng chuỗi và tránh chuyển đổi NA mặc định
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
 
-    # Clean column names (remove BOM, strip whitespace)
-    df.columns = [col.replace('\ufeff', '').strip() for col in df.columns]
+    # Làm sạch tên cột: loại bỏ ký tự BOM và khoảng trắng thừa
+    df.columns = df.columns.str.strip().str.replace('\ufeff', '')
 
-    # Handle sub-header row (if "STT" column exists and has specific values)
-    # Interpretation: If the 'STT' column contains specific string values, drop those rows.
-    # This assumes the true header is correctly parsed by pd.read_csv (header=0).
-    if 'STT' in df.columns:
-        initial_rows_count = df.shape[0]
-        df = df[~df['STT'].isin(['STT', 'No.', 'No'])].reset_index(drop=True)
-        if df.shape[0] < initial_rows_count:
-            app.logger.info(f"Dropped {initial_rows_count - df.shape[0]} sub-header like rows based on 'STT' column values.")
+    # Xử lý dòng tiêu đề phụ nếu tồn tại cột "STT"
+    if 'STT' in df.columns and not df.empty:
+        # Check if the first data row (index 0 after header read) contains typical sub-header values
+        sub_header_indicators = {"STT", "No.", "No"}
+        if df.iloc[0]['STT'] in sub_header_indicators:
+            df = df.iloc[1:].copy() # Drop the sub-header row
+            df.reset_index(drop=True, inplace=True)
 
-    # Detect and standardize date column
-    date_col_name = None
+    # Phát hiện và chuẩn hóa cột ngày
+    date_col_found = False
     if 'Date' in df.columns:
-        date_col_name = 'Date'
-        app.logger.info("Using existing 'Date' column.")
+        df['Date'] = parse_date_dayfirst(df['Date'])
+        date_col_found = True
     else:
-        # Try to find the best candidate for date column
+        # Tìm cột có tỷ lệ giá trị ngày hợp lệ cao nhất
         best_date_col = None
         max_valid_dates = -1
+        
         for col in df.columns:
-            # Check for a reasonable number of unique values that aren't empty
-            if df[col].nunique(dropna=True) < 2: # A date column should have some variation
+            # Skip if column is entirely empty strings or just whitespace
+            if df[col].astype(str).str.strip().eq('').all():
                 continue
             
-            # Attempt to parse as date and count valid dates
             parsed = parse_date_dayfirst(df[col])
-            valid_dates_count = parsed.count() # Number of non-NaT values
+            valid_dates_count = parsed.count() # Count non-NaT values
             
-            # Candidate column must have at least 50% valid dates and more valid dates than previous best
-            if valid_dates_count > max_valid_dates and valid_dates_count >= (len(df) * 0.5):
+            if valid_dates_count > max_valid_dates:
                 max_valid_dates = valid_dates_count
                 best_date_col = col
         
         if best_date_col:
-            app.logger.info(f"Detected '{best_date_col}' as the date column based on validity.")
             df['Date'] = parse_date_dayfirst(df[best_date_col])
-            # If the best_date_col is not 'Date', drop the original to avoid redundancy
-            if best_date_col != 'Date':
-                df = df.drop(columns=[best_date_col])
-            date_col_name = 'Date'
+            date_col_found = True
         else:
-            app.logger.error("No suitable date column found in the CSV based on content analysis.")
-            raise ValueError("No suitable date column found in the CSV. Ensure there is a 'Date' column or a column with clear date values.")
+            raise ValueError("Không thể tìm thấy cột ngày hợp lệ trong tệp CSV.")
     
-    # Ensure 'Date' column is in datetime format after potential detection/re-parsing
-    if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df['Date'] = parse_date_dayfirst(df['Date'])
-    elif 'Date' not in df.columns: # This case should ideally be caught by previous logic
-        raise ValueError("Date column could not be established in the DataFrame.")
+    if not date_col_found:
+        raise ValueError("Không thể tìm thấy hoặc phân tích cú pháp cột ngày hợp lệ.")
 
-
-    # Ensure numeric columns `No1` to `No27`
+    # Đảm bảo cột số: Thêm cột NoX nếu thiếu
     for col in NO_COLS:
         if col not in df.columns:
-            df[col] = '' # Add empty string column if missing
-            app.logger.warning(f"Column '{col}' was missing and added as empty.")
+            df[col] = '' # Thêm cột với giá trị rỗng
 
-    # Drop rows where 'Date' value is NaT (invalid dates), sort, and reset index
-    df = df.dropna(subset=['Date']).sort_values('Date').reset_index(drop=True)
+    # Loại bỏ các dòng có giá trị "Date" là NaT (không hợp lệ)
+    df.dropna(subset=['Date'], inplace=True)
     
     if df.empty:
-        raise ValueError("DataFrame is empty after date cleaning. Check your input CSV or date parsing logic.")
+        raise ValueError("Không có dữ liệu hợp lệ sau khi phân tích ngày.")
 
+    # Sắp xếp DataFrame theo "Date"
+    df.sort_values(by='Date', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Trả về một DataFrame mới chỉ chứa cột "Date" và các cột No1 đến No27
     return df[['Date'] + NO_COLS]
-
 
 def count_digits_0_9(row: pd.Series) -> dict:
     """
-    Counts the frequency of each digit (0-9) in the tens and units place
-    of numbers found in columns No1 to No27 for a given row.
+    Đối với một dòng dữ liệu (tương ứng với một ngày), đếm tần suất xuất hiện của
+    từng chữ số (0-9) ở hàng chục và hàng đơn vị của các số trong các cột No1 đến No27.
     """
     counts = {str(i): 0 for i in range(10)}
-    
-    for col in NO_COLS:
-        value = str(row[col]).strip()
-        if not value: # Skip empty values
+
+    for col_name in NO_COLS:
+        value = str(row[col_name]).strip()
+        if not value:
             continue
 
-        digits_to_count = []
+        processed = False
         try:
-            # Try converting to integer
-            num = int(float(value)) # Use float first to handle potential "1.0" or similar
-            s_num = f"{abs(num):02d}" # Format absolute value as two digits (e.g., 5 -> "05", -5 -> "05")
-            
-            # Count tens and units place
-            if len(s_num) >= 2:
-                digits_to_count.append(s_num[-2]) # Tens place
-                digits_to_count.append(s_num[-1]) # Units place
-            elif len(s_num) == 1: # Single digit numbers only count units place (implicitly tens is 0)
-                digits_to_count.append('0') # Tens place is 0
-                digits_to_count.append(s_num[-1]) # Units place
+            # Cố gắng chuyển đổi thành số nguyên
+            num = int(value)
+            # Định dạng thành chuỗi hai chữ số (e.g., 5 -> "05", 12 -> "12")
+            num_str = f'{num:02d}'
+            if len(num_str) >= 2:
+                tens_digit = num_str[-2]
+                units_digit = num_str[-1]
+                counts[tens_digit] += 1
+                counts[units_digit] += 1
+                processed = True
         except ValueError:
-            # If not a clean integer, extract all digits from the string
-            all_digits = [c for c in value if c.isdigit()]
-            if len(all_digits) >= 2:
-                digits_to_count.append(all_digits[-2]) # Tens place (last two digits of all extracted digits)
-                digits_to_count.append(all_digits[-1]) # Units place
-            elif len(all_digits) == 1:
-                digits_to_count.append('0') # Tens place is 0
-                digits_to_count.append(all_digits[-1])
-
-        for digit in digits_to_count:
-            if '0' <= digit <= '9':
-                counts[digit] += 1
+            # Nếu không thể chuyển đổi thành số nguyên, trích xuất chữ số
+            digits = re.findall(r'\d', value)
+            if len(digits) >= 2:
+                tens_digit = digits[-2]
+                units_digit = digits[-1]
+                counts[tens_digit] += 1
+                counts[units_digit] += 1
+                processed = True
+        
     return counts
-
 
 def make_rows_for_date(date_val: pd.Timestamp, counts: dict) -> list:
     """
-    Creates 10 output data rows (Min1-Min5, Max1-Max5) for a specific date,
-    based on the counted digit frequencies.
+    Tạo 10 dòng dữ liệu đầu ra (Min1-Min5, Max1-Max5) cho một ngày cụ thể,
+    dựa trên tần suất chữ số đã đếm được.
     """
-    # Group digits by their frequency
-    # freq -> list of digits (sorted for consistent output)
-    freq_map = {} 
-    for digit, freq in counts.items():
-        if freq not in freq_map:
-            freq_map[freq] = []
-        freq_map[freq].append(digit)
-
-    # Get unique frequencies and sort them for Min and Max
-    unique_freqs_sorted_asc = sorted(list(freq_map.keys()))
-    unique_freqs_sorted_desc = sorted(list(freq_map.keys()), reverse=True)
-    
     out_rows = []
+    
+    # Lấy các mức tần suất duy nhất và sắp xếp
+    unique_freqs = sorted(list(set(counts.values())))
+    
+    asc_freqs = unique_freqs
+    desc_freqs = sorted(unique_freqs, reverse=True)
 
-    def create_output_row_dict(label: str, freq_val: str, digits_list: list) -> dict:
+    def create_output_row(label: str, freq: int):
         row_dict = {
             "Date": date_val,
             "D2": label,
-            "Freq": freq_val,
-            "Count": len(digits_list) if freq_val != '' else ''
+            "Freq": freq,
+            "Count": 0 
         }
-        for d in range(10):
-            row_dict[str(d)] = str(d) if str(d) in digits_list else ''
+        digit_count_for_freq = 0
+        
+        for digit in range(10):
+            s_digit = str(digit)
+            if counts.get(s_digit) == freq:
+                row_dict[s_digit] = s_digit
+                digit_count_for_freq += 1
+            else:
+                row_dict[s_digit] = '' # Để trống nếu chữ số không có tần suất đó
+        
+        row_dict["Count"] = digit_count_for_freq
         return row_dict
 
-    # Min1-Min5
+    # Tạo dòng Min1-Min5
     for i in range(5):
-        label = f"Min{i+1}"
-        if i < len(unique_freqs_sorted_asc):
-            freq = unique_freqs_sorted_asc[i]
-            digits = sorted(freq_map[freq]) # Sort digits within the same frequency for consistency
-            out_rows.append(create_output_row_dict(label, freq, digits))
+        if i < len(asc_freqs):
+            freq = asc_freqs[i]
+            out_rows.append(create_output_row(f"Min{i+1}", freq))
         else:
-            # Fill with empty data if less than 5 unique frequencies
-            out_rows.append(create_output_row_dict(label, '', []))
+            # Điền các dòng rỗng nếu không đủ 5 mức tần suất
+            out_rows.append({
+                "Date": date_val, "D2": f"Min{i+1}", "Freq": '', "Count": '',
+                **{str(d): '' for d in range(10)}
+            })
 
-    # Max1-Max5
+    # Tạo dòng Max1-Max5
     for i in range(5):
-        label = f"Max{i+1}"
-        if i < len(unique_freqs_sorted_desc):
-            freq = unique_freqs_sorted_desc[i]
-            digits = sorted(freq_map[freq]) # Sort digits within the same frequency for consistency
-            out_rows.append(create_output_row_dict(label, freq, digits))
+        if i < len(desc_freqs):
+            freq = desc_freqs[i]
+            out_rows.append(create_output_row(f"Max{i+1}", freq))
         else:
-            # Fill with empty data if less than 5 unique frequencies
-            out_rows.append(create_output_row_dict(label, '', []))
+            # Điền các dòng rỗng nếu không đủ 5 mức tần suất
+            out_rows.append({
+                "Date": date_val, "D2": f"Max{i+1}", "Freq": '', "Count": '',
+                **{str(d): '' for d in range(10)}
+            })
             
     return out_rows
 
-
-@app.route('/', methods=['GET'])
-def home():
-    """Simple health check endpoint."""
-    app.logger.info("Home endpoint accessed.")
-    return jsonify({"message": "Python Flask backend is running and ready to process CSV files."})
-
-
 @app.route('/process_csv', methods=['POST'])
 def process_csv_endpoint():
-    """
-    API endpoint to receive a CSV file, process it, and return the result as a new CSV.
-    """
     if 'file' not in request.files:
-        app.logger.warning("No file part in the request.")
-        return jsonify({"error": "No file part in the request. Please upload a CSV file."}), 400
-
+        return jsonify({"error": "No file part in the request"}), 400
+    
     file = request.files['file']
     if file.filename == '':
-        app.logger.warning("No selected file.")
-        return jsonify({"error": "No selected file. Please choose a CSV file."}), 400
-
+        return jsonify({"error": "No selected file"}), 400
+    
     if file and file.filename.endswith('.csv'):
-        try:
-            # Create a temporary directory to store input and output files
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_path = Path(tmpdir)
-                input_file_path = tmp_path / "Lucky.csv"
+        # Use TemporaryDirectory to ensure cleanup of temporary files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_csv_path = Path(tmpdir) / file.filename
+            output_csv_path = Path(tmpdir) / 'D2.csv'
+            
+            # Save the uploaded file temporarily
+            file.save(input_csv_path)
+            
+            try:
+                # Load and preprocess the input CSV
+                df_input = load_csv(input_csv_path)
                 
-                # Save the uploaded file to the temporary path
-                file.save(input_file_path)
-                app.logger.info(f"Uploaded file saved to: {input_file_path}")
-
-                # Load and process the input CSV
-                input_df = load_csv(input_file_path)
-                app.logger.info(f"Input CSV loaded with {len(input_df)} rows after cleaning.")
-
-                out_rows = []
-                for index, row in input_df.iterrows():
+                all_output_rows = []
+                
+                # Process each row (day) in the input DataFrame
+                for index, row in df_input.iterrows():
                     date_val = row['Date']
                     digit_counts = count_digits_0_9(row)
-                    out_rows.extend(make_rows_for_date(date_val, digit_counts))
+                    date_output_rows = make_rows_for_date(date_val, digit_counts)
+                    all_output_rows.extend(date_output_rows)
                 
-                app.logger.info(f"Processed data for {len(input_df)} dates, generated {len(out_rows)} output rows.")
-
-                # Create the output DataFrame
-                output_columns = ["Date", "D2", "Freq", "Count"] + [str(d) for d in range(10)]
-                output_df = pd.DataFrame(out_rows, columns=output_columns)
-
-                # Format Date column for output
-                output_df['Date'] = output_df['Date'].dt.strftime("%d-%m-%Y")
-
-                # Save the output to a temporary CSV file
-                output_file_name = "D2.csv"
-                output_file_path = tmp_path / output_file_name
-                output_df.to_csv(output_file_path, index=False, encoding='utf-8')
-                app.logger.info(f"Output CSV saved to: {output_file_path}")
-
-                # Send the processed CSV file back as a response
-                return send_file(
-                    output_file_path,
-                    mimetype='text/csv',
-                    as_attachment=True,
-                    download_name=output_file_name
-                )
-
-        except FileNotFoundError as e:
-            app.logger.error(f"File not found error: {e}")
-            return jsonify({"error": str(e)}), 404
-        except ValueError as e:
-            app.logger.error(f"Data processing error: {e}")
-            return jsonify({"error": f"Error processing CSV data: {str(e)}"}), 400
-        except Exception as e:
-            app.logger.error(f"An unexpected error occurred during CSV processing: {e}", exc_info=True)
-            return jsonify({"error": f"An internal server error occurred: {str(e)}. Please check server logs for details."}), 500
+                # Create final DataFrame from all generated output rows
+                output_cols = ["Date", "D2", "Freq", "Count"] + [str(i) for i in range(10)]
+                df_output = pd.DataFrame(all_output_rows, columns=output_cols)
+                
+                # Format Date column for output CSV
+                df_output['Date'] = df_output['Date'].dt.strftime("%d-%m-%Y")
+                
+                # Export to D2.csv
+                df_output.to_csv(output_csv_path, index=False, encoding='utf-8')
+                
+                # Send the generated D2.csv back to the client
+                return send_file(output_csv_path, mimetype='text/csv', as_attachment=True, download_name='D2.csv')
+                
+            except FileNotFoundError as e:
+                return jsonify({"error": str(e)}), 404
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+            except Exception as e:
+                app.logger.error(f"An unexpected error occurred: {e}", exc_info=True)
+                return jsonify({"error": f"An internal server error occurred: {str(e)}"}), 500
     else:
-        app.logger.warning(f"Invalid file type uploaded: {file.filename if file else 'None'}")
-        return jsonify({"error": "Invalid file type. Please upload a .csv file."}), 400
+        return jsonify({"error": "Invalid file type. Please upload a CSV file."}), 400
+
+@app.route('/')
+def home():
+    """
+    Root endpoint for the API. Provides a simple status message.
+    """
+    return jsonify({"message": "CSV Digit Frequency Analyzer API is running. Upload CSV to /process_csv"}), 200
 
 if __name__ == '__main__':
-    # When running locally, Flask's development server is used
-    # On Render, gunicorn will be used, which handles port automatically
-    port = int(os.environ.get('PORT', 5000))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    # For local development, run with debug=True.
+    # On Render.com, Gunicorn will manage the app, and PORT will be set by environment.
+    app.run(debug=True, host='0.0.0.0', port=os.environ.get('PORT', 5000))
